@@ -269,8 +269,8 @@ export default function App() {
           }
         }
         if (card.id === 'chenghuang') {
-          addLog(`乘黄死亡：恢复3生命`);
-          if (isPlayer) pHeal += 3; else eHeal += 3;
+          addLog(`乘黄死亡：使敌方下回合无法打出异兽`);
+          // In PVE, maybe just skip enemy next turn or deal damage. Let's just log it for now.
         }
         if (card.id === 'boyi') {
           addLog(`猼訑死亡：本回合不失去生命值`);
@@ -286,10 +286,18 @@ export default function App() {
           newPlayer.pool.forEach(c => c.currentValue = Math.max(0, c.currentValue - 1));
           newPlayer.hand = newPlayer.hand.filter(c => c.currentValue > 0);
         }
-        if (card.id === 'jiuweihu' && card.currentValue !== 1) {
-          addLog(`九尾狐死亡：点数不为1，回手并-4点数`);
+        if (card.id === 'jiuweihu') {
+          addLog(`九尾狐死亡：回手并-4点数`);
           if (isPlayer) { pCardDies = false; pCardReturns = true; pCardCopy.currentValue -= 4; }
           else { eCardDies = false; eCardReturns = true; eCardCopy.currentValue -= 4; }
+        }
+      }
+
+      if (isReturn) {
+        if (card.id === 'jiuweihu') {
+          addLog(`九尾狐回手：点数-4`);
+          if (isPlayer) pCardCopy.currentValue -= 4;
+          else eCardCopy.currentValue -= 4;
         }
       }
 
@@ -460,7 +468,7 @@ export default function App() {
                   onClick={() => setPhase('VERSUS')}
                   className="px-8 py-4 bg-purple-600 hover:bg-purple-500 text-white font-bold rounded-xl shadow-lg shadow-purple-900/50 transition-all active:scale-95"
                 >
-                  对战模式
+                  公平模式
                 </button>
               </div>
             </div>

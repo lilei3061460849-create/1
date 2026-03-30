@@ -41,6 +41,16 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
   const [baizePendingCard, setBaizePendingCard] = useState<Card | null>(null);
   const [jingweiPendingCard, setJingweiPendingCard] = useState<Card | null>(null);
   const [revealState, setRevealState] = useState<{pCard: Card, eCard: Card, result: string, events: string[]} | null>(null);
+  const [pPoison, setPPoison] = useState(0);
+  const [ePoison, setEPoison] = useState(0);
+  const [pDisabledCardId, setPDisabledCardId] = useState<string | null>(null);
+  const [eDisabledCardId, setEDisabledCardId] = useState<string | null>(null);
+  const [targetSelection, setTargetSelection] = useState<{
+    sourceCard: Card;
+    validTargets: string[];
+    message: string;
+    onSelect: (id: string) => void;
+  } | null>(null);
 
   useEffect(() => {
     isProcessingRef.current = false;
@@ -196,6 +206,7 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
 
   const playCard = (pCard: Card) => {
     if (phase !== 'BATTLE' || isAiThinking || revealState || baizePendingCard || jingweiPendingCard || isProcessingRef.current) return;
+    if (pCard.instanceId === pDisabledCardId) return;
     
     if (pCard.id === 'baize') {
       isProcessingRef.current = true;
@@ -217,17 +228,22 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
     isProcessingRef.current = true;
     setIsAiThinking(true);
 
+    setPDisabledCardId(null);
+    setEDisabledCardId(null);
+
     try {
-      let eCard = eHand[0];
+      let playableEHand = eHand.filter(c => c.instanceId !== eDisabledCardId);
+      if (playableEHand.length === 0) playableEHand = eHand; // Fallback if all disabled (shouldn't happen)
+      let eCard = playableEHand[0];
     
     if (useHeuristic) {
       await new Promise(resolve => setTimeout(resolve, 500));
       const pAvg = pHand.reduce((sum, c) => sum + c.currentValue, 0) / pHand.length;
-      const winningCards = eHand.filter(c => c.currentValue > pAvg);
+      const winningCards = playableEHand.filter(c => c.currentValue > pAvg);
       if (winningCards.length > 0) {
         eCard = winningCards.reduce((min, c) => c.currentValue < min.currentValue ? c : min, winningCards[0]);
       } else {
-        eCard = eHand.reduce((min, c) => c.currentValue < min.currentValue ? c : min, eHand[0]);
+        eCard = playableEHand.reduce((min, c) => c.currentValue < min.currentValue ? c : min, playableEHand[0]);
       }
     } else {
       try {
@@ -236,12 +252,12 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
         你正在玩一个卡牌对战游戏。
         你的HP: ${eHP}, 对手HP: ${pHP}。
         你的手牌：
-        ${eHand.map(c => `- ID: ${c.id}, 名称: ${c.name}, 当前点数: ${c.currentValue}, 描述: ${c.description}`).join('\n')}
+        ${playableEHand.map(c => `- ID: ${c.id}, 名称: ${c.name}, 当前点数: ${c.currentValue}, 描述: ${c.description}`).join('\n')}
         
         对手的手牌（公开）：
         ${pHand.map(c => `- ID: ${c.id}, 名称: ${c.name}, 当前点数: ${c.currentValue}, 描述: ${c.description}`).join('\n')}
         
-        规则：双方同时出牌，点数大者获胜。胜者对败者造成2点伤害。平局各受1点伤害。点数>3的卡牌会额外造成1点伤害。
+        规则：双方同时出牌，点数大者获胜。胜者对败者造成2点伤害。平局各受1点伤害。点数>=4的卡牌会额外造成1点伤害。
         请根据当前局势，选择一张你要打出的卡牌。
         返回你选择的卡牌的ID。
         `;
@@ -262,7 +278,7 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
         });
         
         const json = JSON.parse(response.text || '{}');
-        const selectedCard = eHand.find(c => c.id === json.selectedCardId);
+        const selectedCard = playableEHand.find(c => c.id === json.selectedCardId);
         if (selectedCard) eCard = selectedCard;
       } catch (e: any) {
         if (e?.status === 429 || e?.status === 'RESOURCE_EXHAUSTED' || JSON.stringify(e).includes('quota') || e?.message?.includes('429')) {
@@ -272,11 +288,11 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
         }
         // Fallback to heuristic
         const pAvg = pHand.reduce((sum, c) => sum + c.currentValue, 0) / pHand.length;
-        const winningCards = eHand.filter(c => c.currentValue > pAvg);
+        const winningCards = playableEHand.filter(c => c.currentValue > pAvg);
         if (winningCards.length > 0) {
           eCard = winningCards.reduce((min, c) => c.currentValue < min.currentValue ? c : min, winningCards[0]);
         } else {
-          eCard = eHand.reduce((min, c) => c.currentValue < min.currentValue ? c : min, eHand[0]);
+          eCard = playableEHand.reduce((min, c) => c.currentValue < min.currentValue ? c : min, playableEHand[0]);
         }
       }
     }
@@ -312,6 +328,11 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
     let eDisableEffects = false;
     let pCardRemoved = false;
     let eCardRemoved = false;
+    let nextPDisabledCardId: string | null = null;
+    let nextEDisabledCardId: string | null = null;
+
+    if (pPoison > 0) { pDamage += pPoison; events.push(`你因中毒失去${pPoison}生命`); }
+    if (ePoison > 0) { eDamage += ePoison; events.push(`敌方因中毒失去${ePoison}生命`); }
 
     // Qilin check
     if (pCardCopy.id === 'qilin') { eDisableEffects = true; events.push(`你的【麒麟】发动能力，封印了敌方异兽能力！`); }
@@ -351,16 +372,36 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
     if (!pDisableEffects) {
       if (pCardCopy.id === 'changyou') { pCardCopy.currentValue = eCardCopy.currentValue; events.push(`你的【长右】发动能力，点数变为敌方点数(${eCardCopy.currentValue})`); }
       if (pCardCopy.id === 'bian') { pCardCopy.currentValue += 1; events.push(`你的【狴犴】发动能力，点数+1`); }
-      if (pCardCopy.id === 'bibi' && !pCardCopy.playedOnce) { pCardCopy.currentValue += 2; events.push(`你的【獙獙】首次打出，点数+2`); }
+      if (pCardCopy.id === 'bibi') {
+        const validTargets = [...newPHand, ...newEHand].filter(c => c.currentValue < c.baseValue);
+        if (validTargets.length > 0) {
+          const targetId = await new Promise<string>((resolve) => {
+            setTargetSelection({
+              sourceCard: pCardCopy,
+              validTargets: validTargets.map(c => c.instanceId),
+              message: `【獙獙】触发能力，请选择目标使其恢复初始点数`,
+              onSelect: (id) => {
+                setTargetSelection(null);
+                resolve(id);
+              }
+            });
+          });
+          const target = [...newPHand, ...newEHand].find(c => c.instanceId === targetId);
+          if (target) {
+            target.currentValue = target.baseValue;
+            events.push(`你的【獙獙】发动能力，使【${target.name}】恢复为初始点数`);
+          }
+        }
+      }
       if (pCardCopy.id === 'dijiang') { pCardCopy.currentValue = Math.floor(Math.random() * 9) + 1; events.push(`你的【帝江】发动能力，点数随机变为${pCardCopy.currentValue}`); }
       if (pCardCopy.id === 'kuafu') { pDamage += 1; events.push(`你的【夸父】发动能力，你失去1生命`); }
       if (pCardCopy.id === 'baize') {
         if (baizeGuess === 'GT5') {
-          if (eCardCopy.currentValue > 5) { pCardCopy.currentValue += 2; events.push(`你的【白泽】猜测成功(敌方>5)，点数+2`); }
-          else { pCardCopy.currentValue -= 2; events.push(`你的【白泽】猜测失败(敌方<=5)，点数-2`); }
+          if (eCardCopy.currentValue > 5) { pCardCopy.currentValue += 3; events.push(`你的【白泽】猜测成功(敌方>5)，点数+3`); }
+          else { pCardCopy.currentValue -= 1; events.push(`你的【白泽】猜测失败(敌方<=5)，点数-1`); }
         } else if (baizeGuess === 'LTE5') {
-          if (eCardCopy.currentValue <= 5) { pCardCopy.currentValue += 2; events.push(`你的【白泽】猜测成功(敌方<=5)，点数+2`); }
-          else { pCardCopy.currentValue -= 2; events.push(`你的【白泽】猜测失败(敌方>5)，点数-2`); }
+          if (eCardCopy.currentValue <= 5) { pCardCopy.currentValue += 3; events.push(`你的【白泽】猜测成功(敌方<=5)，点数+3`); }
+          else { pCardCopy.currentValue -= 1; events.push(`你的【白泽】猜测失败(敌方>5)，点数-1`); }
         }
       }
     }
@@ -368,7 +409,14 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
     if (!eDisableEffects) {
       if (eCardCopy.id === 'changyou') { eCardCopy.currentValue = pCardCopy.currentValue; events.push(`敌方的【长右】发动能力，点数变为你的点数(${pCardCopy.currentValue})`); }
       if (eCardCopy.id === 'bian') { eCardCopy.currentValue += 1; events.push(`敌方的【狴犴】发动能力，点数+1`); }
-      if (eCardCopy.id === 'bibi' && !eCardCopy.playedOnce) { eCardCopy.currentValue += 2; events.push(`敌方的【獙獙】首次打出，点数+2`); }
+      if (eCardCopy.id === 'bibi') {
+        const validTargets = [...newEHand, ...newPHand].filter(c => c.currentValue < c.baseValue);
+        if (validTargets.length > 0) {
+          let bestTarget = validTargets.reduce((best, c) => (c.baseValue - c.currentValue > best.baseValue - best.currentValue) ? c : best, validTargets[0]);
+          bestTarget.currentValue = bestTarget.baseValue;
+          events.push(`敌方的【獙獙】发动能力，使【${bestTarget.name}】恢复为初始点数`);
+        }
+      }
       if (eCardCopy.id === 'dijiang') { eCardCopy.currentValue = Math.floor(Math.random() * 9) + 1; events.push(`敌方的【帝江】发动能力，点数随机变为${eCardCopy.currentValue}`); }
       if (eCardCopy.id === 'kuafu') { eDamage += 1; events.push(`敌方的【夸父】发动能力，敌方失去1生命`); }
       if (eCardCopy.id === 'baize') {
@@ -377,18 +425,18 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
         const eGuess = gt5Count > lte5Count ? 'GT5' : 'LTE5';
         
         if (eGuess === 'GT5') {
-          if (pCardCopy.currentValue > 5) { eCardCopy.currentValue += 2; events.push(`敌方的【白泽】猜测成功(你>5)，点数+2`); }
-          else { eCardCopy.currentValue -= 2; events.push(`敌方的【白泽】猜测失败(你<=5)，点数-2`); }
+          if (pCardCopy.currentValue > 5) { eCardCopy.currentValue += 3; events.push(`敌方的【白泽】猜测成功(你>5)，点数+3`); }
+          else { eCardCopy.currentValue -= 1; events.push(`敌方的【白泽】猜测失败(你<=5)，点数-1`); }
         } else {
-          if (pCardCopy.currentValue <= 5) { eCardCopy.currentValue += 2; events.push(`敌方的【白泽】猜测成功(你<=5)，点数+2`); }
-          else { eCardCopy.currentValue -= 2; events.push(`敌方的【白泽】猜测失败(你>5)，点数-2`); }
+          if (pCardCopy.currentValue <= 5) { eCardCopy.currentValue += 3; events.push(`敌方的【白泽】猜测成功(你<=5)，点数+3`); }
+          else { eCardCopy.currentValue -= 1; events.push(`敌方的【白泽】猜测失败(你>5)，点数-1`); }
         }
       }
     }
 
-    // Apply >3 negative stats rule
-    if (pCardCopy.currentValue > 3) { pDamage += 1; events.push(`你的异兽点数大于3，你额外受到1点反噬伤害`); }
-    if (eCardCopy.currentValue > 3) { eDamage += 1; events.push(`敌方异兽点数大于3，敌方额外受到1点反噬伤害`); }
+    // Apply >=4 negative stats rule
+    if (pCardCopy.currentValue >= 4) { pDamage += 1; events.push(`你的异兽点数≥4，你受到1点反噬伤害`); }
+    if (eCardCopy.currentValue >= 4) { eDamage += 1; events.push(`敌方异兽点数≥4，敌方受到1点反噬伤害`); }
 
     // Capture history state before winner reduction
     const historyPCard = cloneCard(pCardCopy);
@@ -450,7 +498,7 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
     }
 
     // Death/Return effects
-    const handleDeathOrReturn = (card: Card, isPlayer: boolean, isDeath: boolean, isReturn: boolean, disabled: boolean) => {
+    const handleDeathOrReturn = async (card: Card, isPlayer: boolean, isDeath: boolean, isReturn: boolean, disabled: boolean) => {
       const prefix = isPlayer ? '你的' : '敌方的';
       if (disabled) return;
       if (isDeath) {
@@ -460,10 +508,6 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
           const processHand = (hand: Card[], discard: Card[], isPlayerHand: boolean) => {
             let remaining: Card[] = [];
             for (let c of hand) {
-              if (c.id === 'dijiang') {
-                remaining.push(c);
-                continue;
-              }
               c.currentValue -= 1;
               if (c.currentValue <= 0) {
                 discard.push(c);
@@ -510,8 +554,36 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
           }
         }
         if (card.id === 'chenghuang') {
-          if (isPlayer) pHeal += 3; else eHeal += 3;
-          events.push(`${prefix}【乘黄】死亡，恢复3生命`);
+          if (isPlayer) {
+            if (newEHand.length > 0) {
+              const targetId = await new Promise<string>((resolve) => {
+                setTargetSelection({
+                  sourceCard: card,
+                  validTargets: newEHand.map(c => c.instanceId),
+                  message: `【乘黄】触发能力，请选择敌方目标使其下回合无法打出`,
+                  onSelect: (id) => {
+                    setTargetSelection(null);
+                    resolve(id);
+                  }
+                });
+              });
+              const target = newEHand.find(c => c.instanceId === targetId);
+              if (target) {
+                nextEDisabledCardId = target.instanceId;
+                events.push(`${prefix}【乘黄】死亡，使敌方下回合无法打出【${target.name}】`);
+              }
+            } else {
+              events.push(`${prefix}【乘黄】死亡，但敌方没有手牌`);
+            }
+          } else {
+            if (newPHand.length > 0) {
+              const target = newPHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newPHand[0]);
+              nextPDisabledCardId = target.instanceId;
+              events.push(`${prefix}【乘黄】死亡，使你下回合无法打出【${target.name}】`);
+            } else {
+              events.push(`${prefix}【乘黄】死亡，但你没有手牌`);
+            }
+          }
         }
         if (card.id === 'boyi') {
           if (isPlayer) pNoDamage = true; else eNoDamage = true;
@@ -521,10 +593,10 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
           pDamage += 2; eDamage += 2;
           events.push(`${prefix}【蜚】死亡，双方各失去2生命`);
         }
-        if (card.id === 'jiuweihu' && card.currentValue !== 1) {
+        if (card.id === 'jiuweihu') {
           if (isPlayer) { pCardDies = false; pCardReturns = true; pCardCopy.currentValue -= 4; }
           else { eCardDies = false; eCardReturns = true; eCardCopy.currentValue -= 4; }
-          events.push(`${prefix}【九尾狐】死亡，因点数不为1，回手并-4点数`);
+          events.push(`${prefix}【九尾狐】死亡，回手并-4点数`);
         }
         if (card.id === 'jingwei') {
           if (isPlayer && jingweiTarget && currentPDiscard.some(c => c.instanceId === jingweiTarget.instanceId)) {
@@ -543,47 +615,67 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
             }
           }
         }
-      }
-      if (isDeath || isReturn) {
         if (card.id === 'taotie') {
           if (isPlayer) { eCardRemoved = true; }
           else { pCardRemoved = true; }
-          events.push(`${prefix}【饕餮】发动能力，将对手异兽移出游戏`);
+          events.push(`${prefix}【饕餮】死亡，将对手异兽移出游戏`);
         }
         if (card.id === 'fenghuang') {
-          if (isPlayer) pHeal += 1; else eHeal += 1;
-          events.push(`${prefix}【凤凰】发动能力，恢复1生命`);
-        }
-        if (card.id === 'yongyan') {
-          if (isPlayer) eDamage += 1; else pDamage += 1;
-          events.push(`${prefix}【永焰】发动能力，对手失去1生命`);
+          if (isPlayer) pHeal += 2; else eHeal += 2;
+          events.push(`${prefix}【凤凰】死亡，恢复2生命`);
         }
       }
       if (isReturn) {
+        if (card.id === 'fenghuang') {
+          if (isPlayer) pHeal += 2; else eHeal += 2;
+          events.push(`${prefix}【凤凰】回手，恢复2生命`);
+        }
+        if (card.id === 'yongyan') {
+          if (isPlayer) {
+            setEPoison(prev => prev + 1);
+            events.push(`${prefix}【永焰】回手，敌方每回合将失去1生命`);
+          } else {
+            setPPoison(prev => prev + 1);
+            events.push(`${prefix}【永焰】回手，你每回合将失去1生命`);
+          }
+        }
         if (card.id === 'zhujian') {
           if (isPlayer && newEHand.length > 0) {
-            const min = newEHand.reduce((min, c) => c.currentValue < min.currentValue ? c : min, newEHand[0]);
-            events.push(`你的【诸犍】回手，查看到敌方最小点数牌是【${min.name}(${min.currentValue})】`);
+            const target = newEHand[Math.floor(Math.random() * newEHand.length)];
+            target.currentValue -= 2;
+            events.push(`你的【诸犍】回手，查看到敌方随机牌是【${target.name}】，使其点数-2`);
+            if (target.currentValue <= 0) {
+              newEHand = newEHand.filter(c => c.instanceId !== target.instanceId);
+              currentEDiscard.push(target);
+              events.push(`敌方的【${target.name}】点数降至0而死亡`);
+            }
           } else if (!isPlayer && newPHand.length > 0) {
-            const min = newPHand.reduce((min, c) => c.currentValue < min.currentValue ? c : min, newPHand[0]);
-            events.push(`敌方的【诸犍】回手，查看到你最小点数牌是【${min.name}(${min.currentValue})】`);
+            const target = newPHand[Math.floor(Math.random() * newPHand.length)];
+            target.currentValue -= 2;
+            events.push(`敌方的【诸犍】回手，查看到你随机牌是【${target.name}】，使其点数-2`);
+            if (target.currentValue <= 0) {
+              newPHand = newPHand.filter(c => c.instanceId !== target.instanceId);
+              currentPDiscard.push(target);
+              events.push(`你的【${target.name}】点数降至0而死亡`);
+            }
           }
+        }
+        if (card.id === 'jiuweihu') {
+          if (isPlayer) pCardCopy.currentValue -= 4;
+          else eCardCopy.currentValue -= 4;
+          events.push(`${prefix}【九尾狐】回手，点数-4`);
         }
       }
     };
 
-    handleDeathOrReturn(pCardCopy, true, pCardDies, pCardReturns, pDisableEffects);
-    handleDeathOrReturn(eCardCopy, false, eCardDies, eCardReturns, eDisableEffects);
+    await handleDeathOrReturn(pCardCopy, true, pCardDies, pCardReturns, pDisableEffects);
+    await handleDeathOrReturn(eCardCopy, false, eCardDies, eCardReturns, eDisableEffects);
 
     if (pNoDamage) pDamage = 0;
     if (eNoDamage) eDamage = 0;
 
     pCardCopy.playedOnce = true;
     eCardCopy.playedOnce = true;
-
-    // Revert Bibi's temporary +2 buff so it doesn't stay at 4 points permanently
-    if (pCardCopy.id === 'bibi' && !pCard.playedOnce) pCardCopy.currentValue = Math.max(1, pCardCopy.currentValue - 2);
-    if (eCardCopy.id === 'bibi' && !eCard.playedOnce) eCardCopy.currentValue = Math.max(1, eCardCopy.currentValue - 2);
 
     if (pCardRemoved) { pCardDies = true; pCardReturns = false; }
     if (eCardRemoved) { eCardDies = true; eCardReturns = false; }
@@ -628,6 +720,8 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
         pHP: Math.min(15, Math.max(0, pHP - pDamage + pHeal)),
         eHP: Math.min(15, Math.max(0, eHP - eDamage + eHeal))
       }]);
+      setPDisabledCardId(nextPDisabledCardId);
+      setEDisabledCardId(nextEDisabledCardId);
       setTurnCount(c => c + 1);
 
       if (pHP - pDamage + pHeal <= 0 || eHP - eDamage + eHeal <= 0 || newPHand.length === 0 || newEHand.length === 0) {
@@ -653,7 +747,7 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
             <button onClick={onExit} className="p-2 hover:bg-stone-800 rounded-full transition-colors">
               <ArrowLeft className="w-6 h-6 text-stone-400" />
             </button>
-            <h1 className="text-2xl font-bold tracking-widest text-purple-500">对战模式</h1>
+            <h1 className="text-2xl font-bold tracking-widest text-purple-500">公平模式</h1>
           </div>
           <div className="flex items-center gap-8 text-lg font-bold">
             <div className="flex items-center gap-2 text-red-400"><Heart /> 你: {pHP}</div>
@@ -710,9 +804,24 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
                           initial={{ opacity: 0, scale: 0.8 }}
                           animate={{ opacity: 1, scale: 1 }}
                           exit={{ opacity: 0, scale: 0.8 }}
-                          whileHover={{ scale: 1.05, y: -5 }}
-                          onClick={() => playCard(card)}
-                          className="cursor-pointer"
+                          whileHover={
+                            targetSelection?.validTargets.includes(card.instanceId) ? { scale: 1.05, y: -5 } :
+                            (targetSelection || card.instanceId === pDisabledCardId) ? {} : { scale: 1.05, y: -5 }
+                          }
+                          onClick={() => {
+                            if (targetSelection) {
+                              if (targetSelection.validTargets.includes(card.instanceId)) {
+                                targetSelection.onSelect(card.instanceId);
+                              }
+                            } else {
+                              playCard(card);
+                            }
+                          }}
+                          className={`
+                            ${targetSelection ? (targetSelection.validTargets.includes(card.instanceId) ? 'cursor-pointer ring-4 ring-amber-500 rounded-xl' : 'opacity-50 grayscale cursor-not-allowed') : ''}
+                            ${!targetSelection && card.instanceId === pDisabledCardId ? 'opacity-50 grayscale cursor-not-allowed' : ''}
+                            ${!targetSelection && card.instanceId !== pDisabledCardId ? 'cursor-pointer' : ''}
+                          `}
                         >
                           <MiniCard card={card} />
                         </motion.div>
@@ -735,7 +844,7 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
                         <div className="text-center">
                           <h3 className="text-xl font-bold text-amber-500 mb-2">白泽的预知</h3>
                           <p className="text-stone-300 text-sm">请猜测敌方本回合打出的异兽点数。</p>
-                          <p className="text-stone-400 text-xs mt-1">（猜中点数+2，猜错点数-2）</p>
+                          <p className="text-stone-400 text-xs mt-1">（猜中点数+3，猜错点数-1）</p>
                         </div>
                         <div className="flex gap-4 w-full max-w-xs mt-4">
                           <button 
@@ -802,6 +911,19 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
                           取消打出
                         </button>
                       </motion.div>
+                    ) : targetSelection ? (
+                      <motion.div
+                        key="target"
+                        initial={{ opacity: 0, scale: 0.8 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.8 }}
+                        className="flex flex-col items-center gap-4 w-full"
+                      >
+                        <div className="text-center">
+                          <h3 className="text-xl font-bold text-amber-500 mb-2">选择目标</h3>
+                          <p className="text-stone-300 text-sm">{targetSelection.message}</p>
+                        </div>
+                      </motion.div>
                     ) : revealState ? (
                       <motion.div 
                         key="reveal"
@@ -846,11 +968,31 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
                 <div className="w-2/5 flex flex-col items-center justify-start gap-6 bg-stone-800/30 rounded-3xl p-6 border border-stone-700/50 overflow-y-auto">
                   <span className="text-stone-500 font-bold text-lg border-b border-stone-700 pb-2 w-full text-center">敌方手牌 ({eHand.length})</span>
                   <div className="flex flex-wrap gap-4 justify-center w-full">
-                    {eHand.map(c => (
-                      <div key={c.instanceId} className="w-24 h-36 bg-stone-800 border-2 border-stone-700 rounded-xl flex items-center justify-center shadow-inner">
-                        <span className="text-stone-600 text-3xl font-bold">?</span>
-                      </div>
-                    ))}
+                    <AnimatePresence>
+                      {eHand.map(card => (
+                        <motion.div
+                          key={card.instanceId}
+                          initial={{ opacity: 0, scale: 0.8 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          exit={{ opacity: 0, scale: 0.8 }}
+                          whileHover={
+                            targetSelection?.validTargets.includes(card.instanceId) ? { scale: 1.05, y: -5 } :
+                            (targetSelection || card.instanceId === eDisabledCardId) ? {} : { scale: 1.05, y: -5 }
+                          }
+                          onClick={() => {
+                            if (targetSelection && targetSelection.validTargets.includes(card.instanceId)) {
+                              targetSelection.onSelect(card.instanceId);
+                            }
+                          }}
+                          className={`
+                            ${targetSelection ? (targetSelection.validTargets.includes(card.instanceId) ? 'cursor-pointer ring-4 ring-amber-500 rounded-xl' : 'opacity-50 grayscale cursor-not-allowed') : ''}
+                            ${!targetSelection && card.instanceId === eDisabledCardId ? 'opacity-50 grayscale cursor-not-allowed' : ''}
+                          `}
+                        >
+                          <MiniCard card={card} />
+                        </motion.div>
+                      ))}
+                    </AnimatePresence>
                   </div>
                 </div>
 
