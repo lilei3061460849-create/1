@@ -2,11 +2,47 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Card } from './types';
 import { ALIEN_BEASTS } from './cards';
 import { cloneCard } from './utils';
-import { Shield, Sword, Heart, History, ArrowLeft, Loader2, X, Download } from 'lucide-react';
+import { Shield, Sword, Heart, History, ArrowLeft, Loader2, X, Download, Settings } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { GoogleGenAI, Type } from '@google/genai';
+import { getAiDraftChoice, getAiChoice } from './aiLogic';
 
-type VersusPhase = 'DRAFT' | 'BATTLE' | 'GAMEOVER';
+export interface CardStats {
+  id: string;
+  name: string;
+  draftRound: number;
+  owner: 'P1' | 'P2';
+  playCount: number;
+  winCount: number;
+  survivalRounds: number;
+  damageDealt: number;
+  healingDone: number;
+  wasPlayed: boolean;
+}
+
+export interface TurnRecord {
+  round: number;
+  p1Card: Card;
+  p2Card: Card;
+  p1DamageTaken: number;
+  p2DamageTaken: number;
+  p1Healing: number;
+  p2Healing: number;
+  events: string[];
+}
+
+export interface GameReport {
+  timestamp: string;
+  p1Type: PlayerType;
+  p2Type: PlayerType;
+  winner: 'P1' | 'P2' | 'DRAW' | null;
+  p1Stats: Record<string, CardStats>;
+  p2Stats: Record<string, CardStats>;
+  turns: TurnRecord[];
+  errors?: string[];
+}
+
+type VersusPhase = 'SETUP' | 'DRAFT' | 'BATTLE' | 'GAMEOVER';
+type PlayerType = 'HUMAN' | 'AI_LOCAL' | 'AI_GEMINI';
 
 interface HistoryRecord {
   turn: number;
@@ -19,7 +55,9 @@ interface HistoryRecord {
 }
 
 export default function VersusMode({ onExit }: { onExit: () => void }) {
-  const [phase, setPhase] = useState<VersusPhase>('DRAFT');
+  const [phase, setPhase] = useState<VersusPhase>('SETUP');
+  const [pType, setPType] = useState<PlayerType>('HUMAN');
+  const [eType, setEType] = useState<PlayerType>('AI_GEMINI');
   const [pool, setPool] = useState<Card[]>([]);
   const [pHand, setPHand] = useState<Card[]>([]);
   const [eHand, setEHand] = useState<Card[]>([]);
@@ -51,6 +89,16 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
     message: string;
     onSelect: (id: string) => void;
   } | null>(null);
+
+  const gameReportRef = useRef<GameReport>({
+    timestamp: new Date().toISOString(),
+    p1Type: 'HUMAN',
+    p2Type: 'AI_GEMINI',
+    winner: null,
+    p1Stats: {},
+    p2Stats: {},
+    turns: []
+  });
 
   useEffect(() => {
     isProcessingRef.current = false;
@@ -89,92 +137,61 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
 
   // AI Draft Logic
   useEffect(() => {
-    if (phase === 'DRAFT' && draftTurn === 'ENEMY' && pool.length > 0 && !isAiThinking) {
+    if (phase === 'DRAFT' && pool.length > 0 && !isAiThinking) {
+      const currentType = draftTurn === 'PLAYER' ? pType : eType;
+      if (currentType === 'HUMAN') return;
+
       const doAiDraft = async () => {
         setIsAiThinking(true);
         
-        const processAiPick = (card: Card) => {
-          if (draftedCardsRef.current.has(card.instanceId)) return;
-          draftedCardsRef.current.add(card.instanceId);
-
-          setEHand(prev => [...prev, card]);
-          const newPool = pool.filter(c => c.instanceId !== card.instanceId);
-          setPool(newPool);
-
-          let newSeq = [...draftSequence].slice(1);
-
-          if (card.id === 'biyi') {
-            const nextIdx = newSeq.indexOf('ENEMY');
-            if (nextIdx !== -1) {
-              newSeq.splice(nextIdx, 1);
-            }
-          }
-
-          setDraftSequence(newSeq);
-
-          if (newPool.length === 0 || newSeq.length === 0) {
-            setPhase('BATTLE');
-          }
-        };
-
-        if (useHeuristic) {
-          await new Promise(resolve => setTimeout(resolve, 500));
-          const bestCard = pool.reduce((prev, curr) => (curr.baseValue > prev.baseValue ? curr : prev), pool[0]);
-          processAiPick(bestCard);
+        const myHand = draftTurn === 'PLAYER' ? pHand : eHand;
+        const oppHand = draftTurn === 'PLAYER' ? eHand : pHand;
+        
+        const bestCard = await getAiDraftChoice(pool, myHand, oppHand, currentType as 'AI_LOCAL' | 'AI_GEMINI', gameReportRef.current);
+        
+        if (draftedCardsRef.current.has(bestCard.instanceId)) {
           setIsAiThinking(false);
           return;
         }
+        draftedCardsRef.current.add(bestCard.instanceId);
 
-        try {
-          const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-          const prompt = `
-          你正在玩一个卡牌游戏的轮流选牌（Draft）阶段。
-          目前池子里还有以下卡牌：
-          ${pool.map(c => `- ID: ${c.id}, 名称: ${c.name}, 点数: ${c.baseValue}, 描述: ${c.description}`).join('\n')}
-          
-          你目前已选的卡牌：${eHand.map(c => c.name).join(', ') || '无'}
-          对手已选的卡牌：${pHand.map(c => c.name).join(', ') || '无'}
-          
-          请根据卡牌的点数和效果，选择一张最有利于你的卡牌。
-          返回你选择的卡牌的ID。
-          `;
-          
-          const response = await ai.models.generateContent({
-            model: "gemini-3-flash-preview",
-            contents: prompt,
-            config: {
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  selectedCardId: { type: Type.STRING, description: "选择的卡牌ID" }
-                },
-                required: ["selectedCardId"]
-              }
-            }
-          });
-          
-          const json = JSON.parse(response.text || '{}');
-          let bestCard = pool.find(c => c.id === json.selectedCardId);
-          if (!bestCard) bestCard = pool.reduce((prev, curr) => (curr.baseValue > prev.baseValue ? curr : prev), pool[0]);
-          
-          processAiPick(bestCard!);
-        } catch (e: any) {
-          if (e?.status === 429 || e?.status === 'RESOURCE_EXHAUSTED' || JSON.stringify(e).includes('quota') || e?.message?.includes('429')) {
-            setUseHeuristic(true);
-          } else {
-            console.error("AI Draft Error:", e);
-          }
-          const bestCard = pool.reduce((prev, curr) => (curr.baseValue > prev.baseValue ? curr : prev), pool[0]);
-          processAiPick(bestCard);
-        } finally {
-          setIsAiThinking(false);
+        if (draftTurn === 'PLAYER') {
+          setPHand(prev => [...prev, bestCard]);
+          gameReportRef.current.p1Stats[bestCard.instanceId] = {
+            id: bestCard.id, name: bestCard.name, draftRound: 12 - draftSequence.length + 1,
+            owner: 'P1', playCount: 0, winCount: 0, survivalRounds: 0, damageDealt: 0, healingDone: 0, wasPlayed: false
+          };
+        } else {
+          setEHand(prev => [...prev, bestCard]);
+          gameReportRef.current.p2Stats[bestCard.instanceId] = {
+            id: bestCard.id, name: bestCard.name, draftRound: 12 - draftSequence.length + 1,
+            owner: 'P2', playCount: 0, winCount: 0, survivalRounds: 0, damageDealt: 0, healingDone: 0, wasPlayed: false
+          };
         }
+        
+        const newPool = pool.filter(c => c.instanceId !== bestCard.instanceId);
+        setPool(newPool);
+
+        let newSeq = [...draftSequence].slice(1);
+
+        if (bestCard.id === 'biyi') {
+          const nextIdx = newSeq.indexOf(draftTurn === 'PLAYER' ? 'PLAYER' : 'ENEMY');
+          if (nextIdx !== -1) {
+            newSeq.splice(nextIdx, 1);
+          }
+        }
+
+        setDraftSequence(newSeq);
+
+        if (newPool.length === 0 || newSeq.length === 0) {
+          setPhase('BATTLE');
+        }
+        setIsAiThinking(false);
       };
       
       doAiDraft();
     }
-  }, [draftTurn, phase, pool, eHand, pHand, isAiThinking, draftSequence]);
+  }, [draftTurn, phase, pool, eHand, pHand, isAiThinking, draftSequence, pType, eType]);
 
   const handleDraft = (card: Card) => {
     if (draftTurn !== 'PLAYER' || isAiThinking || isProcessingRef.current) return;
@@ -185,6 +202,10 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
     isProcessingRef.current = true;
     
     setPHand(prev => [...prev, card]);
+    gameReportRef.current.p1Stats[card.instanceId] = {
+      id: card.id, name: card.name, draftRound: 12 - draftSequence.length + 1,
+      owner: 'P1', playCount: 0, winCount: 0, survivalRounds: 0, damageDealt: 0, healingDone: 0, wasPlayed: false
+    };
     const newPool = pool.filter(c => c.instanceId !== card.instanceId);
     setPool(newPool);
     
@@ -203,6 +224,41 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
       setPhase('BATTLE');
     }
   };
+
+  // AI Battle Logic
+  useEffect(() => {
+    if (phase === 'BATTLE' && pType !== 'HUMAN' && !isAiThinking && !revealState && !isProcessingRef.current) {
+      resolvePlayCard(null, null, null);
+    }
+  }, [phase, pType, isAiThinking, revealState, pHand, eHand]);
+
+  // Download report on GAMEOVER
+  useEffect(() => {
+    if (phase === 'GAMEOVER') {
+      const p1FinalHP = pHP;
+      const p2FinalHP = eHP;
+      
+      if (p1FinalHP <= 0 && p2FinalHP <= 0) gameReportRef.current.winner = 'DRAW';
+      else if (p1FinalHP <= 0) gameReportRef.current.winner = 'P2';
+      else if (p2FinalHP <= 0) gameReportRef.current.winner = 'P1';
+      else if (pHand.length === 0 || eHand.length === 0) {
+        if (p1FinalHP > p2FinalHP) gameReportRef.current.winner = 'P1';
+        else if (p2FinalHP > p1FinalHP) gameReportRef.current.winner = 'P2';
+        else gameReportRef.current.winner = 'DRAW';
+      }
+
+      const reportJson = JSON.stringify(gameReportRef.current, null, 2);
+      const blob = new Blob([reportJson], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `shanhai-report-${new Date().getTime()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+  }, [phase]);
 
   const playCard = (pCard: Card) => {
     if (phase !== 'BATTLE' || isAiThinking || revealState || baizePendingCard || jingweiPendingCard || isProcessingRef.current) return;
@@ -223,91 +279,37 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
     resolvePlayCard(pCard, null, null);
   };
 
-  const resolvePlayCard = async (pCard: Card, baizeGuess: 'GT5' | 'LTE5' | null = null, jingweiTarget: Card | null = null) => {
+  const resolvePlayCard = async (pCard: Card | null = null, baizeGuess: 'GT5' | 'LTE5' | null = null, jingweiTarget: Card | null = null) => {
     if (phase !== 'BATTLE' || isAiThinking || revealState || isProcessingRef.current) return;
     isProcessingRef.current = true;
     setIsAiThinking(true);
 
-    setPDisabledCardId(null);
-    setEDisabledCardId(null);
-
     try {
-      let playableEHand = eHand.filter(c => c.instanceId !== eDisabledCardId);
-      if (playableEHand.length === 0) playableEHand = eHand; // Fallback if all disabled (shouldn't happen)
-      let eCard = playableEHand[0];
-    
-    if (useHeuristic) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      const pAvg = pHand.reduce((sum, c) => sum + c.currentValue, 0) / pHand.length;
-      const winningCards = playableEHand.filter(c => c.currentValue > pAvg);
-      if (winningCards.length > 0) {
-        eCard = winningCards.reduce((min, c) => c.currentValue < min.currentValue ? c : min, winningCards[0]);
-      } else {
-        eCard = playableEHand.reduce((min, c) => c.currentValue < min.currentValue ? c : min, playableEHand[0]);
+      let finalPCard = pCard;
+      let finalBaizeGuess = baizeGuess;
+      let finalJingweiTarget = jingweiTarget;
+
+      if (!finalPCard) {
+        const pChoice = await getAiChoice(pHand, eHand, pHP, eHP, pDiscard, pDisabledCardId, pType as 'AI_LOCAL' | 'AI_GEMINI', gameReportRef.current);
+        finalPCard = pChoice.card;
+        finalBaizeGuess = pChoice.baizeGuess;
+        finalJingweiTarget = pChoice.jingweiTarget;
       }
-    } else {
-      try {
-        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-        const prompt = `
-        你正在玩一个卡牌对战游戏。
-        你的HP: ${eHP}, 对手HP: ${pHP}。
-        你的手牌：
-        ${playableEHand.map(c => `- ID: ${c.id}, 名称: ${c.name}, 当前点数: ${c.currentValue}, 描述: ${c.description}`).join('\n')}
-        
-        对手的手牌（公开）：
-        ${pHand.map(c => `- ID: ${c.id}, 名称: ${c.name}, 当前点数: ${c.currentValue}, 描述: ${c.description}`).join('\n')}
-        
-        规则：双方同时出牌，点数大者获胜。胜者对败者造成2点伤害。平局各受1点伤害。点数>=4的卡牌会额外造成1点伤害。
-        请根据当前局势，选择一张你要打出的卡牌。
-        返回你选择的卡牌的ID。
-        `;
-        
-        const response = await ai.models.generateContent({
-          model: "gemini-3-flash-preview",
-          contents: prompt,
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                selectedCardId: { type: Type.STRING, description: "选择的卡牌ID" }
-              },
-              required: ["selectedCardId"]
-            }
-          }
-        });
-        
-        const json = JSON.parse(response.text || '{}');
-        const selectedCard = playableEHand.find(c => c.id === json.selectedCardId);
-        if (selectedCard) eCard = selectedCard;
-      } catch (e: any) {
-        if (e?.status === 429 || e?.status === 'RESOURCE_EXHAUSTED' || JSON.stringify(e).includes('quota') || e?.message?.includes('429')) {
-          setUseHeuristic(true);
-        } else {
-          console.error("AI Play Error:", e);
-        }
-        // Fallback to heuristic
-        const pAvg = pHand.reduce((sum, c) => sum + c.currentValue, 0) / pHand.length;
-        const winningCards = playableEHand.filter(c => c.currentValue > pAvg);
-        if (winningCards.length > 0) {
-          eCard = winningCards.reduce((min, c) => c.currentValue < min.currentValue ? c : min, winningCards[0]);
-        } else {
-          eCard = playableEHand.reduce((min, c) => c.currentValue < min.currentValue ? c : min, playableEHand[0]);
-        }
-      }
-    }
 
-    let eJingweiTarget: Card | null = null;
-    if (eCard.id === 'jingwei' && eDiscard.length > 0) {
-      eJingweiTarget = [...eDiscard].sort((a, b) => b.baseValue - a.baseValue)[0];
-    }
+      const eChoice = await getAiChoice(eHand, pHand, eHP, pHP, eDiscard, eDisabledCardId, eType as 'AI_LOCAL' | 'AI_GEMINI', gameReportRef.current);
+      let eCard = eChoice.card;
+      let eBaizeGuess = eChoice.baizeGuess;
+      let eJingweiTarget = eChoice.jingweiTarget;
 
-    // Remove from hands
-    let newPHand = pHand.filter(c => c.instanceId !== pCard.instanceId);
-    let newEHand = eHand.filter(c => c.instanceId !== eCard.instanceId);
+      setPDisabledCardId(null);
+      setEDisabledCardId(null);
 
-    let pCardCopy = cloneCard(pCard);
-    let eCardCopy = cloneCard(eCard);
+      // Remove from hands
+      let newPHand = pHand.filter(c => c.instanceId !== finalPCard!.instanceId);
+      let newEHand = eHand.filter(c => c.instanceId !== eCard.instanceId);
+
+      let pCardCopy = cloneCard(finalPCard!);
+      let eCardCopy = cloneCard(eCard);
     
     let events: string[] = [];
     
@@ -331,133 +333,190 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
     let nextPDisabledCardId: string | null = null;
     let nextEDisabledCardId: string | null = null;
 
+    // Determine Priority
+    const pPriority = pCardCopy.currentValue !== eCardCopy.currentValue 
+      ? pCardCopy.currentValue < eCardCopy.currentValue 
+      : (newPHand.length !== newEHand.length 
+        ? newPHand.length < newEHand.length 
+        : pHP <= eHP);
+
     if (pPoison > 0) { pDamage += pPoison; events.push(`你因中毒失去${pPoison}生命`); }
     if (ePoison > 0) { eDamage += ePoison; events.push(`敌方因中毒失去${ePoison}生命`); }
 
-    // Qilin check
-    if (pCardCopy.id === 'qilin') { eDisableEffects = true; events.push(`你的【麒麟】发动能力，封印了敌方异兽能力！`); }
-    if (eCardCopy.id === 'qilin') { pDisableEffects = true; events.push(`敌方的【麒麟】发动能力，封印了你的异兽能力！`); }
+    // Phase 1: 打出时 (On Play)
+    const execOnPlayP = () => {
+      if (pCardCopy.id === 'qilin') { eDisableEffects = true; events.push(`你的【麒麟】发动能力，封印了敌方异兽能力！`); }
+      if (!pDisableEffects && pCardCopy.id === 'zhuyan') {
+        if (newPHand.length > 0) {
+          const maxP = newPHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newPHand[0]);
+          newPHand = newPHand.filter(c => c.instanceId !== maxP.instanceId);
+          currentPDiscard.push(maxP);
+          events.push(`你的【朱厌】发动能力，你弃置了最大点数牌【${maxP.name}】`);
+        }
+        if (newEHand.length > 0) {
+          const maxE = newEHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newEHand[0]);
+          newEHand = newEHand.filter(c => c.instanceId !== maxE.instanceId);
+          currentEDiscard.push(maxE);
+          events.push(`你的【朱厌】发动能力，敌方弃置了最大点数牌【${maxE.name}】`);
+        }
+      }
+    };
+    const execOnPlayE = () => {
+      if (eCardCopy.id === 'qilin') { pDisableEffects = true; events.push(`敌方的【麒麟】发动能力，封印了你的异兽能力！`); }
+      if (!eDisableEffects && eCardCopy.id === 'zhuyan') {
+        if (newPHand.length > 0) {
+          const maxP = newPHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newPHand[0]);
+          newPHand = newPHand.filter(c => c.instanceId !== maxP.instanceId);
+          currentPDiscard.push(maxP);
+          events.push(`敌方的【朱厌】发动能力，你弃置了最大点数牌【${maxP.name}】`);
+        }
+        if (newEHand.length > 0) {
+          const maxE = newEHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newEHand[0]);
+          newEHand = newEHand.filter(c => c.instanceId !== maxE.instanceId);
+          currentEDiscard.push(maxE);
+          events.push(`敌方的【朱厌】发动能力，敌方弃置了最大点数牌【${maxE.name}】`);
+        }
+      }
+    };
+    if (pPriority) { execOnPlayP(); execOnPlayE(); } else { execOnPlayE(); execOnPlayP(); }
 
-    if (!pDisableEffects && pCardCopy.id === 'zhuyan') {
-      if (newPHand.length > 0) {
-        const maxP = newPHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newPHand[0]);
-        newPHand = newPHand.filter(c => c.instanceId !== maxP.instanceId);
-        currentPDiscard.push(maxP);
-        events.push(`你的【朱厌】发动能力，你弃置了最大点数牌【${maxP.name}】`);
-      }
-      if (newEHand.length > 0) {
-        const maxE = newEHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newEHand[0]);
-        newEHand = newEHand.filter(c => c.instanceId !== maxE.instanceId);
-        currentEDiscard.push(maxE);
-        events.push(`你的【朱厌】发动能力，敌方弃置了最大点数牌【${maxE.name}】`);
-      }
-    }
-
-    if (!eDisableEffects && eCardCopy.id === 'zhuyan') {
-      if (newPHand.length > 0) {
-        const maxP = newPHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newPHand[0]);
-        newPHand = newPHand.filter(c => c.instanceId !== maxP.instanceId);
-        currentPDiscard.push(maxP);
-        events.push(`敌方的【朱厌】发动能力，你弃置了最大点数牌【${maxP.name}】`);
-      }
-      if (newEHand.length > 0) {
-        const maxE = newEHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newEHand[0]);
-        newEHand = newEHand.filter(c => c.instanceId !== maxE.instanceId);
-        currentEDiscard.push(maxE);
-        events.push(`敌方的【朱厌】发动能力，敌方弃置了最大点数牌【${maxE.name}】`);
-      }
-    }
-
-    // Pre-reveal modifications
-    if (!pDisableEffects) {
-      if (pCardCopy.id === 'changyou') { pCardCopy.currentValue = eCardCopy.currentValue; events.push(`你的【长右】发动能力，点数变为敌方点数(${eCardCopy.currentValue})`); }
-      if (pCardCopy.id === 'bian') { pCardCopy.currentValue += 1; events.push(`你的【狴犴】发动能力，点数+1`); }
-      if (pCardCopy.id === 'bibi') {
-        const validTargets = [...newPHand, ...newEHand].filter(c => c.currentValue < c.baseValue);
-        if (validTargets.length > 0) {
-          const targetId = await new Promise<string>((resolve) => {
-            setTargetSelection({
-              sourceCard: pCardCopy,
-              validTargets: validTargets.map(c => c.instanceId),
-              message: `【獙獙】触发能力，请选择目标使其恢复初始点数`,
-              onSelect: (id) => {
-                setTargetSelection(null);
-                resolve(id);
-              }
-            });
-          });
-          const target = [...newPHand, ...newEHand].find(c => c.instanceId === targetId);
-          if (target) {
-            target.currentValue = target.baseValue;
-            events.push(`你的【獙獙】发动能力，使【${target.name}】恢复为初始点数`);
+    // Phase 2: 展示前 (Pre-reveal modifications)
+    const execPreRevealP = async () => {
+      if (!pDisableEffects) {
+        if (pCardCopy.id === 'changyou') { pCardCopy.currentValue = eCardCopy.currentValue; events.push(`你的【长右】发动能力，点数变为敌方点数(${eCardCopy.currentValue})`); }
+        if (pCardCopy.id === 'bian') { pCardCopy.currentValue += 1; events.push(`你的【狴犴】发动能力，点数+1`); }
+        if (pCardCopy.id === 'bibi') {
+          const validTargets = [...newPHand, ...newEHand].filter(c => c.currentValue < c.baseValue);
+          if (validTargets.length > 0) {
+            let targetId = '';
+            if (pType === 'HUMAN') {
+              targetId = await new Promise<string>((resolve) => {
+                setTargetSelection({
+                  sourceCard: pCardCopy,
+                  validTargets: validTargets.map(c => c.instanceId),
+                  message: `【獙獙】触发能力，请选择目标使其恢复初始点数`,
+                  onSelect: (id) => {
+                    setTargetSelection(null);
+                    resolve(id);
+                  }
+                });
+              });
+            } else {
+              const bestTarget = validTargets.reduce((best, c) => (c.baseValue - c.currentValue > best.baseValue - best.currentValue) ? c : best, validTargets[0]);
+              targetId = bestTarget.instanceId;
+            }
+            const target = [...newPHand, ...newEHand].find(c => c.instanceId === targetId);
+            if (target) {
+              target.currentValue = target.baseValue;
+              events.push(`你的【獙獙】发动能力，使【${target.name}】恢复为初始点数`);
+            }
+          }
+        }
+        if (pCardCopy.id === 'dijiang') { pCardCopy.currentValue = Math.floor(Math.random() * 9) + 1; events.push(`你的【帝江】发动能力，点数随机变为${pCardCopy.currentValue}`); }
+        if (pCardCopy.id === 'kuafu') { pDamage += 1; events.push(`你的【夸父】发动能力，你失去1生命`); }
+        if (pCardCopy.id === 'baize') {
+          if (finalBaizeGuess === 'GT5') {
+            if (eCardCopy.currentValue > 5) { pCardCopy.currentValue += 3; events.push(`你的【白泽】猜测成功(敌方>5)，点数+3`); }
+            else { pCardCopy.currentValue -= 1; events.push(`你的【白泽】猜测失败(敌方<=5)，点数-1`); }
+          } else if (finalBaizeGuess === 'LTE5') {
+            if (eCardCopy.currentValue <= 5) { pCardCopy.currentValue += 3; events.push(`你的【白泽】猜测成功(敌方<=5)，点数+3`); }
+            else { pCardCopy.currentValue -= 1; events.push(`你的【白泽】猜测失败(敌方>5)，点数-1`); }
           }
         }
       }
-      if (pCardCopy.id === 'dijiang') { pCardCopy.currentValue = Math.floor(Math.random() * 9) + 1; events.push(`你的【帝江】发动能力，点数随机变为${pCardCopy.currentValue}`); }
-      if (pCardCopy.id === 'kuafu') { pDamage += 1; events.push(`你的【夸父】发动能力，你失去1生命`); }
-      if (pCardCopy.id === 'baize') {
-        if (baizeGuess === 'GT5') {
-          if (eCardCopy.currentValue > 5) { pCardCopy.currentValue += 3; events.push(`你的【白泽】猜测成功(敌方>5)，点数+3`); }
-          else { pCardCopy.currentValue -= 1; events.push(`你的【白泽】猜测失败(敌方<=5)，点数-1`); }
-        } else if (baizeGuess === 'LTE5') {
-          if (eCardCopy.currentValue <= 5) { pCardCopy.currentValue += 3; events.push(`你的【白泽】猜测成功(敌方<=5)，点数+3`); }
-          else { pCardCopy.currentValue -= 1; events.push(`你的【白泽】猜测失败(敌方>5)，点数-1`); }
+    };
+    const execPreRevealE = async () => {
+      if (!eDisableEffects) {
+        if (eCardCopy.id === 'changyou') { eCardCopy.currentValue = pCardCopy.currentValue; events.push(`敌方的【长右】发动能力，点数变为你的点数(${pCardCopy.currentValue})`); }
+        if (eCardCopy.id === 'bian') { eCardCopy.currentValue += 1; events.push(`敌方的【狴犴】发动能力，点数+1`); }
+        if (eCardCopy.id === 'bibi') {
+          const validTargets = [...newEHand, ...newPHand].filter(c => c.currentValue < c.baseValue);
+          if (validTargets.length > 0) {
+            let targetId = '';
+            if (eType === 'HUMAN') {
+              targetId = await new Promise<string>((resolve) => {
+                setTargetSelection({
+                  sourceCard: eCardCopy,
+                  validTargets: validTargets.map(c => c.instanceId),
+                  message: `【獙獙】触发能力，请选择目标使其恢复初始点数`,
+                  onSelect: (id) => {
+                    setTargetSelection(null);
+                    resolve(id);
+                  }
+                });
+              });
+            } else {
+              const bestTarget = validTargets.reduce((best, c) => (c.baseValue - c.currentValue > best.baseValue - best.currentValue) ? c : best, validTargets[0]);
+              targetId = bestTarget.instanceId;
+            }
+            const target = [...newPHand, ...newEHand].find(c => c.instanceId === targetId);
+            if (target) {
+              target.currentValue = target.baseValue;
+              events.push(`敌方的【獙獙】发动能力，使【${target.name}】恢复为初始点数`);
+            }
+          }
+        }
+        if (eCardCopy.id === 'dijiang') { eCardCopy.currentValue = Math.floor(Math.random() * 9) + 1; events.push(`敌方的【帝江】发动能力，点数随机变为${eCardCopy.currentValue}`); }
+        if (eCardCopy.id === 'kuafu') { eDamage += 1; events.push(`敌方的【夸父】发动能力，敌方失去1生命`); }
+        if (eCardCopy.id === 'baize') {
+          if (eBaizeGuess === 'GT5') {
+            if (pCardCopy.currentValue > 5) { eCardCopy.currentValue += 3; events.push(`敌方的【白泽】猜测成功(你>5)，点数+3`); }
+            else { eCardCopy.currentValue -= 1; events.push(`敌方的【白泽】猜测失败(你<=5)，点数-1`); }
+          } else {
+            if (pCardCopy.currentValue <= 5) { eCardCopy.currentValue += 3; events.push(`敌方的【白泽】猜测成功(你<=5)，点数+3`); }
+            else { eCardCopy.currentValue -= 1; events.push(`敌方的【白泽】猜测失败(你>5)，点数-1`); }
+          }
         }
       }
-    }
+    };
+    if (pPriority) { await execPreRevealP(); await execPreRevealE(); } else { await execPreRevealE(); await execPreRevealP(); }
 
-    if (!eDisableEffects) {
-      if (eCardCopy.id === 'changyou') { eCardCopy.currentValue = pCardCopy.currentValue; events.push(`敌方的【长右】发动能力，点数变为你的点数(${pCardCopy.currentValue})`); }
-      if (eCardCopy.id === 'bian') { eCardCopy.currentValue += 1; events.push(`敌方的【狴犴】发动能力，点数+1`); }
-      if (eCardCopy.id === 'bibi') {
-        const validTargets = [...newEHand, ...newPHand].filter(c => c.currentValue < c.baseValue);
-        if (validTargets.length > 0) {
-          let bestTarget = validTargets.reduce((best, c) => (c.baseValue - c.currentValue > best.baseValue - best.currentValue) ? c : best, validTargets[0]);
-          bestTarget.currentValue = bestTarget.baseValue;
-          events.push(`敌方的【獙獙】发动能力，使【${bestTarget.name}】恢复为初始点数`);
-        }
-      }
-      if (eCardCopy.id === 'dijiang') { eCardCopy.currentValue = Math.floor(Math.random() * 9) + 1; events.push(`敌方的【帝江】发动能力，点数随机变为${eCardCopy.currentValue}`); }
-      if (eCardCopy.id === 'kuafu') { eDamage += 1; events.push(`敌方的【夸父】发动能力，敌方失去1生命`); }
-      if (eCardCopy.id === 'baize') {
-        const gt5Count = pHand.filter(c => c.currentValue > 5).length;
-        const lte5Count = pHand.length - gt5Count;
-        const eGuess = gt5Count > lte5Count ? 'GT5' : 'LTE5';
-        
-        if (eGuess === 'GT5') {
-          if (pCardCopy.currentValue > 5) { eCardCopy.currentValue += 3; events.push(`敌方的【白泽】猜测成功(你>5)，点数+3`); }
-          else { eCardCopy.currentValue -= 1; events.push(`敌方的【白泽】猜测失败(你<=5)，点数-1`); }
-        } else {
-          if (pCardCopy.currentValue <= 5) { eCardCopy.currentValue += 3; events.push(`敌方的【白泽】猜测成功(你<=5)，点数+3`); }
-          else { eCardCopy.currentValue -= 1; events.push(`敌方的【白泽】猜测失败(你>5)，点数-1`); }
-        }
-      }
-    }
-
-    // Apply >=4 negative stats rule
-    if (pCardCopy.currentValue >= 4) { pDamage += 1; events.push(`你的异兽点数≥4，你受到1点反噬伤害`); }
-    if (eCardCopy.currentValue >= 4) { eDamage += 1; events.push(`敌方异兽点数≥4，敌方受到1点反噬伤害`); }
+    // Phase 3: 检测反噬 (Anti-backlash)
+    const execBacklashP = () => { if (pCardCopy.currentValue >= 4) { pDamage += 1; events.push(`你的异兽点数≥4，你受到1点反噬伤害`); } };
+    const execBacklashE = () => { if (eCardCopy.currentValue >= 4) { eDamage += 1; events.push(`敌方异兽点数≥4，敌方受到1点反噬伤害`); } };
+    if (pPriority) { execBacklashP(); execBacklashE(); } else { execBacklashE(); execBacklashP(); }
 
     // Capture history state before winner reduction
     const historyPCard = cloneCard(pCardCopy);
     const historyECard = cloneCard(eCardCopy);
 
+    // Phase 4: 确定胜负 (Win Check)
     let resultText = '';
+    const execWinCheckP = () => {
+      if (!pDisableEffects && pCardCopy.id === 'chiyou' && pCardCopy.currentValue > eCardCopy.currentValue) {
+        pCardDies = true; pCardReturns = false; eDamage += 2; events.push(`你的【蚩尤】发动能力，胜利后额外造成2伤害并死亡`);
+      }
+      if (!pDisableEffects && pCardCopy.id === 'yu' && eCardCopy.currentValue > 5) {
+        if (pCardCopy.currentValue > eCardCopy.currentValue) {
+          events.push(`你的【蜮】发动能力，因敌方大于5点，敌方异兽直接死亡，你的蜮回手`);
+        } else if (pCardCopy.currentValue < eCardCopy.currentValue) {
+          eCardDies = true; eCardReturns = false; pCardDies = false; pCardReturns = true; events.push(`你的【蜮】发动能力，因敌方大于5点，敌方异兽直接死亡，你的蜮回手`);
+        } else {
+          eCardDies = true; pCardDies = false; pCardReturns = true; events.push(`你的【蜮】发动能力，因敌方大于5点，敌方异兽直接死亡，你的蜮回手`);
+        }
+      }
+    };
+    const execWinCheckE = () => {
+      if (!eDisableEffects && eCardCopy.id === 'chiyou' && eCardCopy.currentValue > pCardCopy.currentValue) {
+        eCardDies = true; eCardReturns = false; pDamage += 2; events.push(`敌方的【蚩尤】发动能力，胜利后额外造成2伤害并死亡`);
+      }
+      if (!eDisableEffects && eCardCopy.id === 'yu' && pCardCopy.currentValue > 5) {
+        if (eCardCopy.currentValue > pCardCopy.currentValue) {
+          events.push(`敌方的【蜮】发动能力，因你大于5点，你的异兽直接死亡，敌方蜮回手`);
+        } else if (eCardCopy.currentValue < pCardCopy.currentValue) {
+          pCardDies = true; pCardReturns = false; eCardDies = false; eCardReturns = true; events.push(`敌方的【蜮】发动能力，因你大于5点，你的异兽直接死亡，敌方蜮回手`);
+        } else {
+          pCardDies = true; eCardDies = false; eCardReturns = true; events.push(`敌方的【蜮】发动能力，因你大于5点，你的异兽直接死亡，敌方蜮回手`);
+        }
+      }
+    };
+
     if (pCardCopy.currentValue > eCardCopy.currentValue) {
       eDamage += 2;
       eCardDies = true;
       pCardReturns = true;
       resultText = `你赢了！`;
-      if (!pDisableEffects && pCardCopy.id === 'chiyou') {
-        pCardDies = true; pCardReturns = false; eDamage += 2; events.push(`你的【蚩尤】发动能力，胜利后额外造成2伤害并死亡`);
-      }
-      if (!pDisableEffects && pCardCopy.id === 'yu' && eCardCopy.currentValue > 5) {
-        events.push(`你的【蜮】发动能力，因敌方大于5点，敌方异兽直接死亡，你的蜮回手`);
-      }
-      if (!eDisableEffects && eCardCopy.id === 'yu' && pCardCopy.currentValue > 5) {
-        pCardDies = true; pCardReturns = false; eCardDies = false; eCardReturns = true; events.push(`敌方的【蜮】发动能力，因你大于5点，你的异兽直接死亡，敌方蜮回手`);
-      }
-      
+      if (pPriority) { execWinCheckP(); execWinCheckE(); } else { execWinCheckE(); execWinCheckP(); }
       if (pCardReturns) {
         const oldVal = pCardCopy.currentValue;
         pCardCopy.currentValue -= eCardCopy.currentValue;
@@ -468,16 +527,7 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
       pCardDies = true;
       eCardReturns = true;
       resultText = `你输了！`;
-      if (!eDisableEffects && eCardCopy.id === 'chiyou') {
-        eCardDies = true; eCardReturns = false; pDamage += 2; events.push(`敌方的【蚩尤】发动能力，胜利后额外造成2伤害并死亡`);
-      }
-      if (!eDisableEffects && eCardCopy.id === 'yu' && pCardCopy.currentValue > 5) {
-        events.push(`敌方的【蜮】发动能力，因你大于5点，你的异兽直接死亡，敌方蜮回手`);
-      }
-      if (!pDisableEffects && pCardCopy.id === 'yu' && eCardCopy.currentValue > 5) {
-        eCardDies = true; eCardReturns = false; pCardDies = false; pCardReturns = true; events.push(`你的【蜮】发动能力，因敌方大于5点，敌方异兽直接死亡，你的蜮回手`);
-      }
-      
+      if (pPriority) { execWinCheckP(); execWinCheckE(); } else { execWinCheckE(); execWinCheckP(); }
       if (eCardReturns) {
         const oldVal = eCardCopy.currentValue;
         eCardCopy.currentValue -= pCardCopy.currentValue;
@@ -489,12 +539,7 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
       pCardDies = true;
       eCardDies = true;
       resultText = `平局！`;
-      if (!pDisableEffects && pCardCopy.id === 'yu' && eCardCopy.currentValue > 5) {
-        eCardDies = true; pCardDies = false; pCardReturns = true; events.push(`你的【蜮】发动能力，因敌方大于5点，敌方异兽直接死亡，你的蜮回手`);
-      }
-      if (!eDisableEffects && eCardCopy.id === 'yu' && pCardCopy.currentValue > 5) {
-        pCardDies = true; eCardDies = false; eCardReturns = true; events.push(`敌方的【蜮】发动能力，因你大于5点，你的异兽直接死亡，敌方蜮回手`);
-      }
+      if (pPriority) { execWinCheckP(); execWinCheckE(); } else { execWinCheckE(); execWinCheckP(); }
     }
 
     // Death/Return effects
@@ -556,17 +601,23 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
         if (card.id === 'chenghuang') {
           if (isPlayer) {
             if (newEHand.length > 0) {
-              const targetId = await new Promise<string>((resolve) => {
-                setTargetSelection({
-                  sourceCard: card,
-                  validTargets: newEHand.map(c => c.instanceId),
-                  message: `【乘黄】触发能力，请选择敌方目标使其下回合无法打出`,
-                  onSelect: (id) => {
-                    setTargetSelection(null);
-                    resolve(id);
-                  }
+              let targetId = '';
+              if (pType === 'HUMAN') {
+                targetId = await new Promise<string>((resolve) => {
+                  setTargetSelection({
+                    sourceCard: card,
+                    validTargets: newEHand.map(c => c.instanceId),
+                    message: `【乘黄】触发能力，请选择敌方目标使其下回合无法打出`,
+                    onSelect: (id) => {
+                      setTargetSelection(null);
+                      resolve(id);
+                    }
+                  });
                 });
-              });
+              } else {
+                const target = newEHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newEHand[0]);
+                targetId = target.instanceId;
+              }
               const target = newEHand.find(c => c.instanceId === targetId);
               if (target) {
                 nextEDisabledCardId = target.instanceId;
@@ -577,9 +628,28 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
             }
           } else {
             if (newPHand.length > 0) {
-              const target = newPHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newPHand[0]);
-              nextPDisabledCardId = target.instanceId;
-              events.push(`${prefix}【乘黄】死亡，使你下回合无法打出【${target.name}】`);
+              let targetId = '';
+              if (eType === 'HUMAN') {
+                targetId = await new Promise<string>((resolve) => {
+                  setTargetSelection({
+                    sourceCard: card,
+                    validTargets: newPHand.map(c => c.instanceId),
+                    message: `【乘黄】触发能力，请选择敌方目标使其下回合无法打出`,
+                    onSelect: (id) => {
+                      setTargetSelection(null);
+                      resolve(id);
+                    }
+                  });
+                });
+              } else {
+                const target = newPHand.reduce((max, c) => c.currentValue > max.currentValue ? c : max, newPHand[0]);
+                targetId = target.instanceId;
+              }
+              const target = newPHand.find(c => c.instanceId === targetId);
+              if (target) {
+                nextPDisabledCardId = target.instanceId;
+                events.push(`${prefix}【乘黄】死亡，使你下回合无法打出【${target.name}】`);
+              }
             } else {
               events.push(`${prefix}【乘黄】死亡，但你没有手牌`);
             }
@@ -660,11 +730,6 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
             }
           }
         }
-        if (card.id === 'jiuweihu') {
-          if (isPlayer) pCardCopy.currentValue -= 4;
-          else eCardCopy.currentValue -= 4;
-          events.push(`${prefix}【九尾狐】回手，点数-4`);
-        }
       }
     };
 
@@ -698,8 +763,40 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
     if (eCardReturns && !eCardRemoved) newEHand.push(eCardCopy);
     if (eCardDies && !eCardRemoved) currentEDiscard.push(eCardCopy);
 
+    // Update Game Report Stats
+    const p1Stat = gameReportRef.current.p1Stats[finalPCard!.instanceId];
+    if (p1Stat) {
+      p1Stat.playCount++;
+      p1Stat.wasPlayed = true;
+      if (pCardReturns) p1Stat.survivalRounds++;
+      if (eDamage > 0) p1Stat.damageDealt += eDamage;
+      if (pHeal > 0) p1Stat.healingDone += pHeal;
+      if (resultText === '你赢了！') p1Stat.winCount++;
+    }
+
+    const p2Stat = gameReportRef.current.p2Stats[eCard.instanceId];
+    if (p2Stat) {
+      p2Stat.playCount++;
+      p2Stat.wasPlayed = true;
+      if (eCardReturns) p2Stat.survivalRounds++;
+      if (pDamage > 0) p2Stat.damageDealt += pDamage;
+      if (eHeal > 0) p2Stat.healingDone += eHeal;
+      if (resultText === '你输了！') p2Stat.winCount++;
+    }
+
+    gameReportRef.current.turns.push({
+      round: turnCount,
+      p1Card: cloneCard(historyPCard),
+      p2Card: cloneCard(historyECard),
+      p1DamageTaken: pDamage,
+      p2DamageTaken: eDamage,
+      p1Healing: pHeal,
+      p2Healing: eHeal,
+      events: [...events]
+    });
+
     setRevealState({ pCard: historyPCard, eCard: historyECard, result: resultText, events });
-    setPHand(pHand.filter(c => c.instanceId !== pCard.instanceId));
+    setPHand(pHand.filter(c => c.instanceId !== finalPCard!.instanceId));
     setEHand(eHand.filter(c => c.instanceId !== eCard.instanceId));
     setIsAiThinking(false);
 
@@ -765,6 +862,49 @@ export default function VersusMode({ onExit }: { onExit: () => void }) {
           {/* Main Area */}
           <div className="flex-1 flex flex-col">
             
+            {phase === 'SETUP' && (
+              <div className="flex-1 flex flex-col items-center justify-center space-y-8">
+                <h2 className="text-3xl font-bold text-stone-300 mb-8">选择公平模式</h2>
+                
+                <div className="flex gap-12 items-center">
+                  <div className="flex flex-col items-center gap-4 bg-stone-800 p-6 rounded-2xl border border-stone-700 w-64">
+                    <div className="text-xl font-bold text-blue-400">玩家 1</div>
+                    <select 
+                      value={pType} 
+                      onChange={(e) => setPType(e.target.value as PlayerType)}
+                      className="w-full bg-stone-900 border border-stone-600 rounded-lg p-3 text-stone-200 focus:outline-none focus:border-purple-500"
+                    >
+                      <option value="HUMAN">人类玩家</option>
+                      <option value="AI_LOCAL">本地 AI (快速)</option>
+                      <option value="AI_GEMINI">云端 AI (智能)</option>
+                    </select>
+                  </div>
+
+                  <div className="text-2xl font-bold text-stone-500 italic">VS</div>
+
+                  <div className="flex flex-col items-center gap-4 bg-stone-800 p-6 rounded-2xl border border-stone-700 w-64">
+                    <div className="text-xl font-bold text-red-400">玩家 2</div>
+                    <select 
+                      value={eType} 
+                      onChange={(e) => setEType(e.target.value as PlayerType)}
+                      className="w-full bg-stone-900 border border-stone-600 rounded-lg p-3 text-stone-200 focus:outline-none focus:border-purple-500"
+                    >
+                      <option value="HUMAN">人类玩家</option>
+                      <option value="AI_LOCAL">本地 AI (快速)</option>
+                      <option value="AI_GEMINI">云端 AI (智能)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <button 
+                  onClick={() => setPhase('DRAFT')}
+                  className="mt-12 px-12 py-4 bg-gradient-to-r from-purple-600 to-red-600 hover:from-purple-500 hover:to-red-500 rounded-xl font-bold text-xl shadow-lg shadow-purple-900/50 transition-all transform hover:scale-105"
+                >
+                  开始选牌
+                </button>
+              </div>
+            )}
+
             {phase === 'DRAFT' && (
               <div className="flex-1 flex flex-col items-center justify-center space-y-6">
                 <h2 className="text-2xl font-bold text-amber-500">
